@@ -43,10 +43,17 @@ class VideoTrimCropApp:
         self.drag_origin: tuple[int, int] | None = None
         self.is_dragging: bool = False
 
+        # Zoom / pan state (all in normalised 0-1 video space)
+        self._zoom: float = 1.0          # 1.0 = full frame, >1 = zoomed in
+        self._pan_x: float = 0.5         # centre of view, normalised
+        self._pan_y: float = 0.5
+        self._pan_drag_origin: tuple[int, int] | None = None  # canvas px
+        self._pan_drag_start: tuple[float, float] = (0.5, 0.5)  # pan at drag start
+
         # Current displayed photo image (keep reference to prevent GC)
         self._photo: ImageTk.PhotoImage | None = None
-        # Cached raw PIL frame (without bbox overlay)
-        self._current_pil: Image.Image | None = None
+        # Raw full-resolution frame stored as numpy (BGR)
+        self._current_frame_bgr: object = None
 
         self._build_ui()
 
@@ -73,9 +80,17 @@ class VideoTrimCropApp:
                                 cursor="crosshair")
         self.canvas.pack()
 
-        self.canvas.bind("<ButtonPress-1>", self._on_mouse_press)
-        self.canvas.bind("<B1-Motion>",     self._on_mouse_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_mouse_release)
+        self.canvas.bind("<ButtonPress-1>",   self._on_mouse_press)
+        self.canvas.bind("<B1-Motion>",          self._on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>",    self._on_mouse_release)
+        # Zoom: scroll wheel (Linux Button-4/5, Windows/Mac MouseWheel)
+        self.canvas.bind("<Button-4>",           self._on_scroll_up)
+        self.canvas.bind("<Button-5>",           self._on_scroll_down)
+        self.canvas.bind("<MouseWheel>",         self._on_mousewheel)
+        # Pan: middle mouse button drag
+        self.canvas.bind("<ButtonPress-2>",      self._on_pan_press)
+        self.canvas.bind("<B2-Motion>",          self._on_pan_drag)
+        self.canvas.bind("<ButtonRelease-2>",    self._on_pan_release)
 
         # Placeholder text
         self.canvas.create_text(CANVAS_MAX_W // 2, CANVAS_MAX_H // 2,
@@ -120,6 +135,12 @@ class VideoTrimCropApp:
         self.lbl_bbox = tk.Label(ctrl_frame, text="BBox: none", width=24,
                                  anchor="w", fg="gray")
         self.lbl_bbox.pack(side=tk.LEFT)
+
+        tk.Button(ctrl_frame, text="Reset Zoom", width=10,
+                  command=self._reset_zoom).pack(side=tk.LEFT, padx=8)
+        self.lbl_zoom = tk.Label(ctrl_frame, text="Zoom: 1.0x", width=12,
+                                 anchor="w", fg="gray")
+        self.lbl_zoom.pack(side=tk.LEFT)
 
         # ── Action row ───────────────────────────────────────────────
         action_frame = tk.Frame(self.root)
@@ -190,6 +211,9 @@ class VideoTrimCropApp:
         self.end_frame = self.total_frames - 1
         self.bbox_canvas = None
         self.current_frame_idx = 0
+        self._zoom = 1.0
+        self._pan_x = 0.5
+        self._pan_y = 0.5
 
         self.slider.config(to=self.total_frames - 1)
         self.slider.set(0)
@@ -220,22 +244,117 @@ class VideoTrimCropApp:
         if not ret:
             return
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb).resize(
-            (self.canvas_w, self.canvas_h), Image.LANCZOS)
-        self._current_pil = pil_img
-
+        self._current_frame_bgr = frame  # store full-res BGR
         self._render_canvas()
 
         self.lbl_current.config(text=self._fmt_time(idx / self.fps))
         # Update slider without triggering callback
         self.slider.set(idx)
 
-    def _render_canvas(self):
-        """Re-draw the canvas from the cached PIL frame + bbox overlay."""
-        if self._current_pil is None:
+    # ------------------------------------------------------------------
+    # Zoom / Pan
+    # ------------------------------------------------------------------
+    def _view_rect(self) -> tuple[int, int, int, int]:
+        """Return (x1,y1,x2,y2) in video pixels for the current zoom/pan."""
+        view_w = self.vid_w / self._zoom
+        view_h = self.vid_h / self._zoom
+        cx = self._pan_x * self.vid_w
+        cy = self._pan_y * self.vid_h
+        x1 = cx - view_w / 2
+        y1 = cy - view_h / 2
+        # clamp so we never go out of bounds
+        x1 = max(0.0, min(x1, self.vid_w - view_w))
+        y1 = max(0.0, min(y1, self.vid_h - view_h))
+        x2 = x1 + view_w
+        y2 = y1 + view_h
+        return int(x1), int(y1), int(x2), int(y2)
+
+    def _on_scroll_up(self, event):
+        self._apply_zoom(1.15, event.x, event.y)
+
+    def _on_scroll_down(self, event):
+        self._apply_zoom(1 / 1.15, event.x, event.y)
+
+    def _on_mousewheel(self, event):
+        """Windows/macOS scroll wheel."""
+        if event.delta > 0:
+            self._apply_zoom(1.15, event.x, event.y)
+        else:
+            self._apply_zoom(1 / 1.15, event.x, event.y)
+
+    def _apply_zoom(self, factor: float, cx: int, cy: int):
+        """Zoom by `factor` keeping canvas point (cx, cy) fixed."""
+        if self._current_frame_bgr is None:
             return
-        img = self._current_pil.copy()
+        # Convert canvas cursor to normalised video space before zoom
+        vr = self._view_rect()
+        vw = vr[2] - vr[0]
+        vh = vr[3] - vr[1]
+        norm_x = vr[0] / self.vid_w + (cx / self.canvas_w) * (vw / self.vid_w)
+        norm_y = vr[1] / self.vid_h + (cy / self.canvas_h) * (vh / self.vid_h)
+
+        new_zoom = max(1.0, min(self._zoom * factor, 20.0))
+        self._zoom = new_zoom
+
+        # Shift pan so the point under the cursor stays fixed
+        new_vw = self.vid_w / self._zoom
+        new_vh = self.vid_h / self._zoom
+        self._pan_x = norm_x + (0.5 - cx / self.canvas_w) * (new_vw / self.vid_w)
+        self._pan_y = norm_y + (0.5 - cy / self.canvas_h) * (new_vh / self.vid_h)
+        # Clamp pan so view stays inside the frame
+        half_w = (self.vid_w / self._zoom) / 2 / self.vid_w
+        half_h = (self.vid_h / self._zoom) / 2 / self.vid_h
+        self._pan_x = max(half_w, min(self._pan_x, 1.0 - half_w))
+        self._pan_y = max(half_h, min(self._pan_y, 1.0 - half_h))
+
+        self.lbl_zoom.config(text=f"Zoom: {self._zoom:.1f}x")
+        self._render_canvas()
+
+    def _on_pan_press(self, event):
+        self._pan_drag_origin = (event.x, event.y)
+        self._pan_drag_start = (self._pan_x, self._pan_y)
+
+    def _on_pan_drag(self, event):
+        if self._pan_drag_origin is None or self._current_frame_bgr is None:
+            return
+        dx = event.x - self._pan_drag_origin[0]
+        dy = event.y - self._pan_drag_origin[1]
+        # Convert canvas delta to normalised video delta
+        vr = self._view_rect()
+        vw = vr[2] - vr[0]
+        vh = vr[3] - vr[1]
+        self._pan_x = self._pan_drag_start[0] - dx * (vw / self.vid_w) / self.canvas_w
+        self._pan_y = self._pan_drag_start[1] - dy * (vh / self.vid_h) / self.canvas_h
+        # Clamp
+        half_w = (self.vid_w / self._zoom) / 2 / self.vid_w
+        half_h = (self.vid_h / self._zoom) / 2 / self.vid_h
+        self._pan_x = max(half_w, min(self._pan_x, 1.0 - half_w))
+        self._pan_y = max(half_h, min(self._pan_y, 1.0 - half_h))
+        self._render_canvas()
+
+    def _on_pan_release(self, event):
+        self._pan_drag_origin = None
+
+    def _reset_zoom(self):
+        self._zoom = 1.0
+        self._pan_x = 0.5
+        self._pan_y = 0.5
+        self.lbl_zoom.config(text="Zoom: 1.0x")
+        self._render_canvas()
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+    def _render_canvas(self):
+        """Re-draw the canvas from the stored raw frame + zoom/pan + bbox overlay."""
+        if self._current_frame_bgr is None:
+            return
+        # Crop to current view rect and resize to canvas
+        x1, y1, x2, y2 = self._view_rect()
+        cropped = self._current_frame_bgr[y1:y2, x1:x2]
+        frame_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb).resize(
+            (self.canvas_w, self.canvas_h), Image.LANCZOS)
 
         if self.bbox_canvas is not None:
             x1, y1, x2, y2 = self._normalise_bbox(self.bbox_canvas)
@@ -430,12 +549,16 @@ class VideoTrimCropApp:
         return x1, y1, x2, y2
 
     def _bbox_to_video(self, bbox):
+        """Convert canvas bbox coords to video pixel coords, respecting zoom/pan."""
         x1, y1, x2, y2 = self._normalise_bbox(bbox)
+        vr = self._view_rect()
+        vw = vr[2] - vr[0]
+        vh = vr[3] - vr[1]
         return (
-            int(x1 * self.scale_x),
-            int(y1 * self.scale_y),
-            int(x2 * self.scale_x),
-            int(y2 * self.scale_y),
+            int(vr[0] + x1 / self.canvas_w * vw),
+            int(vr[1] + y1 / self.canvas_h * vh),
+            int(vr[0] + x2 / self.canvas_w * vw),
+            int(vr[1] + y2 / self.canvas_h * vh),
         )
 
     @staticmethod
