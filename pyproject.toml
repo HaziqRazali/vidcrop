@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "vidcrop"
+version = "0.1.0"
+description = "GUI tool to trim and crop videos"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python",
+    "Pillow",
+]
+
+[project.scripts]
+vidcrop = "vidcrop.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vidcrop*"]
