@@ -5,13 +5,13 @@ GUI tool to trim (cut in time) and crop (cut in space) videos.
 ## Install
 
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/vidcrop.git
+pip install git+https://github.com/HaziqRazali/vidcrop.git
 ```
 
 ## Update
 
 ```bash
-pip install --upgrade git+https://github.com/YOUR_USERNAME/vidcrop.git
+pip install --upgrade git+https://github.com/HaziqRazali/vidcrop.git
 ```
 
 ## Usage
